@@ -27,15 +27,23 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+from gpt_model import GPTConfig, GPT
+from model import nGPTConfig, nGPT
+
+# Default model selection nGPT
+model_class = nGPT
+model_config = nGPTConfig
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 2000
-log_interval = 1
+
+# eval stuff
+eval_interval = 1000
 eval_iters = 200
+log_interval = 10
+
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
@@ -43,24 +51,32 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_notes = """"""
 # data
+data_root_path = None
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
+
 # model
-n_layer = 12
-n_head = 12
-n_embd = 768
+n_layer = None
+n_head = None
+n_embd = None
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+
+# Initialization std
+base_scale_override = None
+
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
-weight_decay = 1e-1
+weight_decay = 0.0
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
@@ -93,6 +109,7 @@ if ddp:
     # down the desired gradient accumulation iterations per process proportionally
     assert gradient_accumulation_steps % ddp_world_size == 0
     gradient_accumulation_steps //= ddp_world_size
+    torch.distributed.barrier()
 else:
     # if not ddp, we are running on a single gpu, and one process
     master_process = True
@@ -103,7 +120,13 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(1337 + seed_offset)
+process_seed = 1337 + seed_offset
+
+torch.manual_seed(process_seed)
+np.random.seed(process_seed)
+torch.manual_seed(process_seed)
+torch.cuda.manual_seed(process_seed)
+
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
@@ -112,7 +135,8 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-data_dir = os.path.join('data', dataset)
+assert data_root_path
+data_dir = os.path.join(data_root_path, dataset)
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -145,7 +169,7 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, base_scale_override=base_scale_override) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -153,8 +177,8 @@ if init_from == 'scratch':
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    gptconf = model_config(**model_args)
+    model = model_class(gptconf)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -166,8 +190,8 @@ elif init_from == 'resume':
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
     # create the model
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    gptconf = model_config(**model_args)
+    model = model_class(gptconf)
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -178,14 +202,7 @@ elif init_from == 'resume':
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
-elif init_from.startswith('gpt2'):
-    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
-    # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = getattr(model.config, k)
+
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
@@ -241,10 +258,68 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
+def normalize_parameters(model):
+    # If we're running a regular GPT training this is a noop
+    if model_class == GPT:
+        return
+
+    assert model_class == nGPT, f"{model_class}"
+
+    def _normalize(x, dim=-1):
+        # Utility to normalize rows or cols in float32
+        x_f32 = x.to(dtype=torch.float32)
+        vector_norms = x_f32.norm(dim=dim, keepdim=True)
+        return (x_f32 / vector_norms).to(dtype=x.dtype)
+
+    # Normalize our wte and wpe
+    wte = model.transformer['wte']
+    with torch.no_grad():
+        wte.weight.data = _normalize(wte.weight.data)
+
+        # Iterate over the internal blocks and rescale the weight matrices
+        for ix, block in enumerate(model.transformer['h']):
+            # Call the submodules which have parameters to normalize
+            attn = block.attn
+
+            # TODO: Determine what to do with the bias in the normalization step.
+            # TODO: it would also make sense to normalize the value matrix along the output embedding dimension rather
+            #  than the input embedding dimension.
+
+            # TODO: there is an ambiguity w.r.t the meaning of the embedding dimension for the projection matrix, we'll
+            #   assume it means the vectors that get linearly combined to produce the output
+
+            # normalize the qkv and the output projection matrices
+            embedding_dim = attn.c_attn.in_features
+
+            qkv_attn_weight = attn.c_attn.weight
+
+            # Compute the row norm for the k qnd q components
+            qkv_attn_weight.data[:2 * embedding_dim, :] = _normalize(qkv_attn_weight[:2 * embedding_dim, :])
+
+            # The value subset of the matrix should have normalized columns rather than rows!
+            qkv_attn_weight.data[2 * embedding_dim:, :] = _normalize(qkv_attn_weight[2 * embedding_dim:, :], dim=-2)
+
+            # We also probably want the projection to form vectors that are convex combinations of unit length vectors
+            c_proj_weight = attn.c_proj.weight
+            c_proj_weight.data = _normalize(c_proj_weight, dim=-2)
+
+            # Normalization of the MLP matrices
+            mlp = block.mlp
+            c_fc_u_weight = mlp.c_fc_u.weight
+            c_fc_u_weight.data = _normalize(c_fc_u_weight)
+
+            c_fc_v_weight = mlp.c_fc_v.weight
+            c_fc_v_weight.data = _normalize(c_fc_v_weight.data)
+
+            # The embedding dimension here could be interpreted as the output dimension rather than the input
+            c_proj_weight = mlp.c_proj.weight
+            c_proj_weight.data = _normalize(c_proj_weight, dim=-2)
+
+
 # logging
 if wandb_log and master_process:
     import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    wandb.init(project=wandb_project, name=wandb_run_name, notes=wandb_notes, config=config)
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
@@ -261,6 +336,8 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
+        rng_state_pytorch = torch.get_rng_state()
+        rng_state_bytes = rng_state_pytorch.numpy().tobytes()
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
@@ -281,11 +358,20 @@ while True:
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
                     'config': config,
+                    'rng_state_pytorch_bytes': rng_state_bytes,
+                    'rng_state_numpy': np.random.get_state()
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
+
+    # Time to normalize all matrices, this gets once per gradient step:
+    if ddp:
+        # If we're using distributed data parallel, then the model is a wrapper
+        normalize_parameters(model.module)
+    else:
+        normalize_parameters(model)
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
@@ -321,10 +407,7 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
     iter_num += 1
     local_iter_num += 1
 
